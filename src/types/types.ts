@@ -113,7 +113,6 @@ export type ViewLocation = "main" | "right-sidebar" | "left-sidebar";
 export interface MediaSettings {
     defaultYouTubeFolder: string;
     defaultYouTubeTag: string;
-    youtubeApiKey: string;
     defaultPodcastFolder: string;
     defaultPodcastTag: string;
     autoDetectMediaType: boolean;
@@ -234,7 +233,6 @@ export const DEFAULT_SETTINGS: RssDashboardSettings = {
     media: {
         defaultYouTubeFolder: "Videos",
         defaultYouTubeTag: "youtube",
-        youtubeApiKey: "",
         defaultPodcastFolder: "Podcasts",
         defaultPodcastTag: "podcast",
         autoDetectMediaType: false,
