@@ -944,6 +944,12 @@ export default class RssDashboardPlugin extends Plugin {
                 this.settings.articleSaving = Object.assign({}, DEFAULT_SETTINGS.articleSaving, this.settings.articleSaving);
             }
 
+            if (!this.settings.media) {
+                this.settings.media = DEFAULT_SETTINGS.media;
+            } else {
+                this.settings.media = Object.assign({}, DEFAULT_SETTINGS.media, this.settings.media);
+            }
+
             // Ensure display settings are properly initialized
             if (!this.settings.display) {
                 this.settings.display = DEFAULT_SETTINGS.display;

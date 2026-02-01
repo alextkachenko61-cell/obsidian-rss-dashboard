@@ -57,6 +57,40 @@ interface JsonFeed {
     items?: JsonFeedItem[];
 }
 
+interface YouTubeChannelResponse {
+    items?: Array<{
+        id?: string;
+        snippet?: {
+            title?: string;
+        };
+        contentDetails?: {
+            relatedPlaylists?: {
+                uploads?: string;
+            };
+        };
+    }>;
+}
+
+interface YouTubePlaylistItemResponse {
+    nextPageToken?: string;
+    items?: Array<{
+        snippet?: {
+            title?: string;
+            description?: string;
+            publishedAt?: string;
+            channelTitle?: string;
+            resourceId?: {
+                videoId?: string;
+            };
+            thumbnails?: Record<string, { url?: string }>;
+        };
+        contentDetails?: {
+            videoId?: string;
+            videoPublishedAt?: string;
+        };
+    }>;
+}
+
 function isValidFeed(text: string): boolean {
     if (!text) return false;
     const sample = text.slice(0, 2048).toLowerCase();
@@ -1737,6 +1771,244 @@ export class FeedParser {
         this.availableTags = availableTags;
         this.parser = new CustomXMLParser();
     }
+
+    private getYouTubeIdentifierFromFeedUrl(url: string): { channelId?: string; username?: string } {
+        try {
+            const parsedUrl = new URL(url);
+            const channelId = parsedUrl.searchParams.get("channel_id") || undefined;
+            const username = parsedUrl.searchParams.get("user") || undefined;
+            return { channelId, username };
+        } catch {
+            return {};
+        }
+    }
+
+    private getYouTubeThumbnail(thumbnails?: Record<string, { url?: string }>): string {
+        if (!thumbnails) return "";
+        return (
+            thumbnails.maxres?.url ||
+            thumbnails.standard?.url ||
+            thumbnails.high?.url ||
+            thumbnails.medium?.url ||
+            thumbnails.default?.url ||
+            ""
+        );
+    }
+
+    private async fetchYouTubeChannelInfo(
+        apiKey: string,
+        channelId?: string,
+        username?: string
+    ): Promise<YouTubeChannelResponse | null> {
+        const params = new URLSearchParams({
+            part: "contentDetails,snippet",
+            key: apiKey
+        });
+        if (channelId) {
+            params.set("id", channelId);
+        } else if (username) {
+            params.set("forUsername", username);
+        } else {
+            return null;
+        }
+        const url = `https://www.googleapis.com/youtube/v3/channels?${params.toString()}`;
+        try {
+            const response = await requestUrl({ url, method: "GET" });
+            return response.json as YouTubeChannelResponse;
+        } catch {
+            return null;
+        }
+    }
+
+    private async fetchYouTubePlaylistItems(
+        apiKey: string,
+        playlistId: string,
+        pageToken?: string
+    ): Promise<YouTubePlaylistItemResponse | null> {
+        const params = new URLSearchParams({
+            part: "snippet,contentDetails",
+            maxResults: "50",
+            playlistId,
+            key: apiKey
+        });
+        if (pageToken) {
+            params.set("pageToken", pageToken);
+        }
+        const url = `https://www.googleapis.com/youtube/v3/playlistItems?${params.toString()}`;
+        try {
+            const response = await requestUrl({ url, method: "GET" });
+            return response.json as YouTubePlaylistItemResponse;
+        } catch {
+            return null;
+        }
+    }
+
+    private finalizeFeed(
+        feed: Feed,
+        existingFeed: Feed | null,
+        feedLogoCandidates: string[] = []
+    ): Feed {
+        this.applyFeedLimits(feed);
+
+        if (feedLogoCandidates.length > 0) {
+            const feedLogoUrl = feedLogoCandidates[0];
+            const coverImageCounts: Record<string, number> = {};
+            feed.items.forEach(item => {
+                if (item.coverImage) {
+                    coverImageCounts[item.coverImage] = (coverImageCounts[item.coverImage] || 0) + 1;
+                }
+            });
+            const totalItems = feed.items.length;
+            Object.entries(coverImageCounts).forEach(([imgUrl, count]) => {
+                if (
+                    imgUrl &&
+                    (imgUrl === feedLogoUrl || feedLogoCandidates.includes(imgUrl)) &&
+                    count >= Math.max(2, Math.floor(totalItems * 0.8))
+                ) {
+                    feed.items.forEach(item => {
+                        if (item.coverImage === imgUrl) {
+                            item.coverImage = "";
+                        }
+                    });
+                }
+            });
+        }
+
+        const processedFeed = MediaService.detectAndProcessFeed(feed);
+        if (processedFeed.mediaType === "video" && !existingFeed?.folder) {
+            processedFeed.folder = this.mediaSettings.defaultYouTubeFolder;
+        } else if (processedFeed.mediaType === "podcast" && !existingFeed?.folder) {
+            processedFeed.folder = this.mediaSettings.defaultPodcastFolder;
+        }
+        return MediaService.applyMediaTags(processedFeed, this.availableTags);
+    }
+
+    private async parseYouTubeApiFeed(url: string, existingFeed: Feed | null = null): Promise<Feed | null> {
+        const apiKey = this.mediaSettings.youtubeApiKey?.trim();
+        if (!apiKey) {
+            return null;
+        }
+
+        const { channelId, username } = this.getYouTubeIdentifierFromFeedUrl(url);
+        const channelInfo = await this.fetchYouTubeChannelInfo(apiKey, channelId, username);
+        const channel = channelInfo?.items?.[0];
+        const uploadsPlaylistId = channel?.contentDetails?.relatedPlaylists?.uploads;
+        if (!uploadsPlaylistId) {
+            return null;
+        }
+
+        const feedTitle = existingFeed?.title || channel?.snippet?.title || "Unnamed feed";
+        const newFeed: Feed = existingFeed || {
+            title: feedTitle,
+            url: url,
+            folder: "Uncategorized",
+            items: [],
+            lastUpdated: Date.now()
+        };
+
+        if (!existingFeed) {
+            newFeed.title = feedTitle;
+        }
+
+        const existingItems = new Map<string, FeedItem>();
+        if (existingFeed) {
+            existingFeed.items.forEach(item => {
+                const existingVideoId =
+                    MediaService.extractYouTubeVideoId(item.link) ||
+                    MediaService.extractYouTubeVideoId(item.guid) ||
+                    item.guid;
+                existingItems.set(existingVideoId, item);
+            });
+        }
+
+        const newItems: FeedItem[] = [];
+        const updatedItems: FeedItem[] = [];
+
+        let pageToken: string | undefined;
+        do {
+            const playlistItems = await this.fetchYouTubePlaylistItems(apiKey, uploadsPlaylistId, pageToken);
+            if (!playlistItems) {
+                break;
+            }
+            playlistItems.items?.forEach(item => {
+                const videoId = item.contentDetails?.videoId || item.snippet?.resourceId?.videoId;
+                if (!videoId) {
+                    return;
+                }
+                const itemGuid = videoId;
+                const existingItem = existingItems.get(itemGuid);
+                const link = `https://www.youtube.com/watch?v=${videoId}`;
+                const description = item.snippet?.description || "";
+                const pubDate = item.contentDetails?.videoPublishedAt || item.snippet?.publishedAt || new Date().toISOString();
+                const coverImage = this.getYouTubeThumbnail(item.snippet?.thumbnails);
+                const title = item.snippet?.title || "No title";
+                const author = item.snippet?.channelTitle;
+
+                if (existingItem) {
+                    const updatedItem: FeedItem = {
+                        ...existingItem,
+                        title,
+                        description,
+                        pubDate,
+                        author: author || existingItem.author,
+                        read: existingItem.read,
+                        starred: existingItem.starred,
+                        tags: existingItem.tags,
+                        saved: existingItem.saved,
+                        feedTitle: newFeed.title,
+                        coverImage: coverImage || existingItem.coverImage,
+                        summary: this.extractSummary(description) || existingItem.summary,
+                        link,
+                        guid: itemGuid
+                    };
+                    updatedItems.push(updatedItem);
+                } else {
+                    const summary = this.extractSummary(description);
+                    const newItem: FeedItem = {
+                        title,
+                        link,
+                        description,
+                        pubDate,
+                        guid: itemGuid,
+                        read: false,
+                        starred: false,
+                        tags: [],
+                        feedTitle: newFeed.title,
+                        feedUrl: newFeed.url,
+                        coverImage,
+                        summary,
+                        author,
+                        saved: false,
+                        mediaType: "video"
+                    };
+                    newItems.push(newItem);
+                }
+            });
+
+            pageToken = playlistItems.nextPageToken;
+        } while (pageToken);
+
+        const allItems: FeedItem[] = [];
+        if (existingFeed) {
+            existingFeed.items.forEach(item => {
+                const existingVideoId =
+                    MediaService.extractYouTubeVideoId(item.link) ||
+                    MediaService.extractYouTubeVideoId(item.guid) ||
+                    item.guid;
+                if (!existingItems.has(existingVideoId)) {
+                    allItems.push(item);
+                }
+            });
+        }
+
+        allItems.push(...updatedItems);
+        allItems.push(...newItems);
+
+        newFeed.items = allItems;
+        newFeed.lastUpdated = Date.now();
+
+        return this.finalizeFeed(newFeed, existingFeed);
+    }
     
     
     private convertToAbsoluteUrl(relativeUrl: string, baseUrl: string): string {
@@ -2132,6 +2404,13 @@ export class FeedParser {
         if (!url) {
             throw new Error("Feed url is required");
         }
+
+        if (MediaService.isYouTubeFeed(url) && this.mediaSettings.youtubeApiKey) {
+            const apiFeed = await this.parseYouTubeApiFeed(url, existingFeed);
+            if (apiFeed) {
+                return apiFeed;
+            }
+        }
         
         const responseText = await fetchFeedXml(url);
         const parsed = this.parser.parseString(responseText);
@@ -2302,47 +2581,13 @@ export class FeedParser {
             newFeed.lastUpdated = Date.now();
 
             
-            this.applyFeedLimits(newFeed);
-
-            
             const feedLogoCandidates = [
                 parsed.feedItunesImage,
                 parsed.feedImageUrl,
                 parsed.image && typeof parsed.image === 'object' ? parsed.image.url : '',
                 typeof parsed.image === 'string' ? parsed.image : ''
             ].filter(Boolean);
-            const feedLogoUrl = feedLogoCandidates.length > 0 ? feedLogoCandidates[0] : '';
-            const coverImageCounts: Record<string, number> = {};
-            newFeed.items.forEach(item => {
-                if (item.coverImage) {
-                    coverImageCounts[item.coverImage] = (coverImageCounts[item.coverImage] || 0) + 1;
-                }
-            });
-            const totalItems = newFeed.items.length;
-            Object.entries(coverImageCounts).forEach(([imgUrl, count]) => {
-                if (
-                    imgUrl &&
-                    (imgUrl === feedLogoUrl || feedLogoCandidates.includes(imgUrl)) &&
-                    count >= Math.max(2, Math.floor(totalItems * 0.8))
-                ) {
-                    newFeed.items.forEach(item => {
-                        if (item.coverImage === imgUrl) {
-                            item.coverImage = '';
-                        }
-                    });
-                }
-            });
-            
-
-            
-            
-            const processedFeed = MediaService.detectAndProcessFeed(newFeed);
-            if (processedFeed.mediaType === 'video' && !existingFeed?.folder) {
-                processedFeed.folder = this.mediaSettings.defaultYouTubeFolder;
-            } else if (processedFeed.mediaType === 'podcast' && !existingFeed?.folder) {
-                processedFeed.folder = this.mediaSettings.defaultPodcastFolder;
-            }
-            return MediaService.applyMediaTags(processedFeed, this.availableTags);
+            return this.finalizeFeed(newFeed, existingFeed, feedLogoCandidates);
     }
     
     /**
