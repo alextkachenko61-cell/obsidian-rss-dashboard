@@ -517,6 +517,19 @@ export class RssDashboardSettingTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                     })
             );
+
+        new Setting(containerEl)
+            .setName("YouTube API key (optional)")
+            .setDesc("Use the YouTube data API to fetch the full channel history instead of the RSS limit.")
+            .addText((text) =>
+                text
+                    .setPlaceholder("API key")
+                    .setValue(this.plugin.settings.media.youtubeApiKey)
+                    .onChange(async (value) => {
+                        this.plugin.settings.media.youtubeApiKey = value.trim();
+                        await this.plugin.saveSettings();
+                    })
+            );
             
         
         new Setting(containerEl).setName("Podcast").setHeading();
